@@ -1,6 +1,6 @@
 # CARibdis
 
-![logo](logo.png)
+<p align="center"><img src="logo.png" alt="logo" width="250" height="250" /></p>
 
 CARibdis swallows IPLD CAR files and does things with them.
 
