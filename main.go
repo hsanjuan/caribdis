@@ -9,8 +9,12 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/ipfs/go-cid"
+	format "github.com/ipfs/go-ipld-format"
+	"github.com/ipfs/go-merkledag"
 	"github.com/ipld/go-car"
 	"github.com/ipld/go-car/util"
+	"github.com/multiformats/go-multicodec"
 	"github.com/urfave/cli/v2"
 )
 
@@ -81,12 +85,13 @@ in several of the input files.
 				},
 			},
 			Action: func(c *cli.Context) error {
-				out := bufio.NewWriterSize(os.Stdout, 1024*1024)
-				defer out.Flush()
-
 				if !c.Args().Present() {
 					return errInputNeeded
 				}
+
+				out := bufio.NewWriterSize(os.Stdout, 1024*1024)
+				defer out.Flush()
+
 				args := c.Args()
 				lastF, err := os.Open(args.Get(args.Len() - 1))
 				if err != nil {
@@ -152,7 +157,6 @@ Lists the blocks in the provided CAR files.
 					return errInputNeeded
 				}
 
-			LS_NEXT:
 				for _, arg := range c.Args().Slice() {
 					f, err := os.Open(arg)
 					if err != nil {
@@ -169,7 +173,7 @@ Lists the blocks in the provided CAR files.
 					for {
 						c, _, err := util.ReadNode(buf)
 						if err == io.EOF {
-							break LS_NEXT
+							break
 						}
 						if err != nil {
 							return err
@@ -211,6 +215,167 @@ Lists the roots in the provided CAR files.
 					}
 				}
 				return nil
+			},
+		},
+		{
+			Name:      "overlay",
+			Usage:     "Create an overlay CAR",
+			ArgsUsage: "file1.car file2.car ...",
+			Description: `
+Generates an overlay CAR made of a DAG that references all the blocks in the
+original CAR files as RAW-CID blocks.
+
+Such CAR file allows to have a fully traversable DAG with a single root even
+when the input CARs only provided incomplete DAGs: the overlay DAG reaches all
+the blocks but, by declaring them as raw, ensure tooling will not attempt to
+interpret them and therefore, attempt to follow links from them.
+
+The overlay DAG can, for example, be use to recursively IPFS-pin all the
+blocks in a CAR file even though when they correspond only to a partial
+DAG where some links cannot be retrieved.
+
+The overlay DAG IPLD nodes will grow until around 500kB at most.
+
+The --shallow flag controls whether the resulting CAR includes the original
+blocks too or only the overlay DAG blocks. In all cases, the resulting CAR
+file will have a single root (the root of the overlay.
+`,
+			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:  "shallow",
+					Usage: "Only include overlay-DAG blocks",
+				},
+				&cli.StringFlag{
+					Name:    "output",
+					Aliases: []string{"o"},
+					Usage:   "Name of the CAR file to write to",
+					Value:   "overlay.car",
+				},
+			},
+			Action: func(c *cli.Context) error {
+				if !c.Args().Present() {
+					return errInputNeeded
+				}
+
+				out, err := os.Create(c.String("output"))
+				if err != nil {
+					return err
+				}
+				defer out.Close()
+
+				builder := cid.V1Builder{
+					Codec:    uint64(multicodec.DagPb),
+					MhType:   uint64(multicodec.Blake3),
+					MhLength: 0,
+				}
+
+				// Write a dummy CAR header We will replace it
+				// at the end with the actual header.
+				// yes totally works.
+				tempCid, err := builder.Sum([]byte("yeah"))
+				if err != nil {
+					return err
+				}
+				err = car.WriteHeader(&car.CarHeader{
+					Roots:   []cid.Cid{tempCid},
+					Version: 1,
+				}, out)
+				if err != nil {
+					return err
+				}
+
+				bufout := bufio.NewWriterSize(out, 1024*1024)
+
+				root := merkledag.NodeWithData(nil)
+				root.SetCidBuilder(builder)
+				linkSizes := 0
+
+			NEXT:
+				for _, arg := range c.Args().Slice() {
+
+					f, err := os.Open(arg)
+					if err != nil {
+						return err
+					}
+					defer f.Close()
+
+					buf := bufio.NewReader(f)
+					_, err = car.ReadHeader(buf)
+					if err != nil {
+						return err
+					}
+
+					for {
+						carBlockCid, data, err := util.ReadNode(buf)
+						if err == io.EOF {
+							break NEXT
+						}
+						if err != nil {
+							return err
+						}
+
+						// Write node as we read it to the output
+						if !c.Bool("shallow") {
+							if err := util.LdWrite(bufout, carBlockCid.Bytes(), data); err != nil {
+								return err
+							}
+						}
+
+						rawCid := cid.NewCidV1(uint64(multicodec.Raw), carBlockCid.Hash())
+						root.AddRawLink("", &format.Link{
+							Size: uint64(len(data)),
+							Cid:  rawCid,
+						})
+						linkSizes += rawCid.ByteLen()
+						if linkSizes > 512*1024 { // 512KiB
+							rootData, err := root.EncodeProtobuf(false)
+							if err != nil {
+								return err
+							}
+							rootCid := root.Cid()
+							newRoot := merkledag.NodeWithData(nil)
+							newRoot.SetCidBuilder(builder)
+							newRoot.AddRawLink("more", &format.Link{
+								Size: uint64(len(rootData)),
+								Cid:  rootCid,
+							})
+							// flush full overlay-DAG-node to new CAR
+							if err := util.LdWrite(bufout, root.Cid().Bytes(), root.RawData()); err != nil {
+								return nil
+							}
+
+							root = newRoot
+							linkSizes = 0
+						}
+					}
+				}
+
+				// flush final root node
+				if err := util.LdWrite(bufout, root.Cid().Bytes(), root.RawData()); err != nil {
+					return nil
+				}
+
+				err = bufout.Flush()
+				if err != nil {
+					return err
+				}
+
+				offset, err := out.Seek(0, 0)
+				if err != nil {
+					return err
+				}
+				if offset != 0 {
+					return errors.New("cannot go back to the start of the file")
+				}
+
+				// This header should measure exactly the same
+				// bytes as the bogus one.
+				err = car.WriteHeader(&car.CarHeader{
+					Roots:   []cid.Cid{root.Cid()},
+					Version: 1,
+				}, out)
+
+				return err
 			},
 		},
 	}
