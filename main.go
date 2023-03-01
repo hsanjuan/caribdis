@@ -284,7 +284,7 @@ file will have a single root (the root of the overlay.
 					return err
 				}
 
-				bufout := bufio.NewWriterSize(out, 1024*1024)
+				bufout := bufio.NewWriterSize(out, 4<<20) // 4MiB
 
 				root := merkledag.NodeWithData(nil)
 				root.SetCidBuilder(builder)
@@ -299,7 +299,7 @@ file will have a single root (the root of the overlay.
 					}
 					defer f.Close()
 
-					buf := bufio.NewReader(f)
+					buf := bufio.NewReaderSize(f, 1<<20) // 1MiB
 					_, err = car.ReadHeader(buf)
 					if err != nil {
 						return err
