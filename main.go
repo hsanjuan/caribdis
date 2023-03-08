@@ -25,7 +25,7 @@ var (
 	errInputNeeded = errors.New("no input file(s) given. See -h")
 )
 
-var Description = `
+var description = `
 caribdis is a command-line tool to work with CAR files.
 `
 
@@ -50,7 +50,7 @@ func main() {
 	app.Name = "caribdis"
 	app.Usage = "CAR files passing by will be swallowed"
 	app.UsageText = "caribdis [global options] [subcommand]..."
-	app.Description = Description
+	app.Description = description
 	//app.Version = "latest"
 	app.Flags = []cli.Flag{}
 
@@ -214,6 +214,70 @@ Lists the roots in the provided CAR files.
 						fmt.Println(root)
 					}
 				}
+				return nil
+			},
+		},
+		{
+			Name:      "stat",
+			Usage:     "Provides some stats",
+			ArgsUsage: "file1.car file2.car ...",
+			Description: `
+Lists total number of blocks, maximum and minimum block sizes and
+other interesting facts about the CAR files.
+`,
+			Flags: []cli.Flag{},
+			Action: func(c *cli.Context) error {
+				if !c.Args().Present() {
+					return errInputNeeded
+				}
+
+				var nRoots, total, minSize, maxSize, avgSize, blocksSize uint64
+				minSize = ^uint64(0)
+
+				for _, arg := range c.Args().Slice() {
+					f, err := os.Open(arg)
+					if err != nil {
+						return err
+					}
+					defer f.Close()
+
+					buf := bufio.NewReader(f)
+					h, err := car.ReadHeader(buf)
+					if err != nil {
+						return err
+					}
+
+					nRoots += uint64(len(h.Roots))
+
+					for {
+						_, b, err := util.ReadNode(buf)
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							return err
+						}
+						total++
+						s := uint64(len(b))
+						if s < minSize {
+							minSize = s
+						}
+						if s > maxSize {
+							maxSize = s
+						}
+						blocksSize += s
+					}
+					avgSize = blocksSize / total
+
+				}
+
+				fmt.Printf("blocks: %d\n", total)
+				fmt.Printf("roots: %d\n", nRoots)
+				fmt.Printf("size: %d B\n", blocksSize)
+				fmt.Printf("min: %d B\n", minSize)
+				fmt.Printf("max: %d B\n", maxSize)
+				fmt.Printf("avg: %d B\n", avgSize)
+
 				return nil
 			},
 		},
